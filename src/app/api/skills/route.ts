@@ -100,8 +100,8 @@ function parseSkillFrontMatter(content: string): { name?: string; description?: 
       continue;
     }
 
-    // Match description: value (single-line)
-    const descMatch = line.match(/^description:\s+(.+)/);
+    // Match description: value (single-line, with or without quotes)
+    const descMatch = line.match(/^description:\s*["']?(.+?)["']?\s*$/);
     if (descMatch) {
       result.description = descMatch[1].trim();
     }
@@ -214,10 +214,16 @@ function scanDirectory(
       const name = prefix ? `${prefix}:${baseName}` : baseName;
       const filePath = fullPath;
       const content = fs.readFileSync(filePath, "utf-8");
-      const firstLine = content.split("\n")[0]?.trim() || "";
-      const description = firstLine.startsWith("#")
-        ? firstLine.replace(/^#+\s*/, "")
-        : firstLine || `Skill: /${name}`;
+      // Try to parse frontmatter first
+      const meta = parseSkillFrontMatter(content);
+      // Use frontmatter description, or fall back to first line heading
+      let description = meta.description;
+      if (!description) {
+        const firstLine = content.split("\n")[0]?.trim() || "";
+        description = firstLine.startsWith("#")
+          ? firstLine.replace(/^#+\s*/, "")
+          : firstLine || `Skill: /${name}`;
+      }
       skills.push({ name, description, content, source, filePath });
     }
   } catch {

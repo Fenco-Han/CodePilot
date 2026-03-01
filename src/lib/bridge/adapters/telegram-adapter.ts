@@ -14,6 +14,7 @@ import type {
 } from '../types';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter';
 import { callTelegramApi, escapeHtml } from './telegram-utils';
+import { proxyFetch } from '../../proxy-agent';
 import { getChannelOffset, setChannelOffset, insertAuditLog } from '../../db';
 import { getSetting } from '../../db';
 
@@ -274,16 +275,19 @@ export class TelegramAdapter extends BaseChannelAdapter {
     const token = this.botToken;
     if (!token) return;
 
+    // Register commands with English names but Chinese descriptions
     await callTelegramApi(token, 'setMyCommands', {
       commands: [
-        { command: 'new', description: 'Start new session (optionally specify path)' },
-        { command: 'bind', description: 'Bind to existing session' },
-        { command: 'cwd', description: 'Change working directory' },
-        { command: 'mode', description: 'Switch mode: plan / code / ask' },
-        { command: 'status', description: 'Show current session status' },
-        { command: 'sessions', description: 'List recent sessions' },
-        { command: 'stop', description: 'Stop current task' },
-        { command: 'help', description: 'Show available commands' },
+        { command: 'new', description: '开始新会话（可选指定路径）' },
+        { command: 'bind', description: '绑定到已有会话' },
+        { command: 'cwd', description: '更改工作目录' },
+        { command: 'mode', description: '切换模式：计划/编码/问答' },
+        { command: 'status', description: '显示当前会话状态' },
+        { command: 'sessions', description: '列出最近会话' },
+        { command: 'stop', description: '停止当前任务' },
+        { command: 'skills', description: '列出可用技能' },
+        { command: 'skill', description: '按编号加载技能' },
+        { command: 'help', description: '显示可用命令' },
       ],
     });
   }
@@ -322,7 +326,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     try {
       const url = `${TELEGRAM_API}/bot${token}/getMe`;
-      const res = await fetch(url, {
+      const res = await proxyFetch(url, {
         method: 'GET',
         signal: AbortSignal.timeout(10_000),
       });
@@ -399,7 +403,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
 
         const url = `${TELEGRAM_API}/bot${token}/getUpdates`;
-        const res = await fetch(url, {
+        const res = await proxyFetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

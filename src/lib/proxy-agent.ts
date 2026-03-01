@@ -12,23 +12,28 @@ import { getSetting } from './db';
  * Get proxy URL from settings or environment variables.
  */
 function getProxyUrl(): string | undefined {
-  // First check database settings
-  const enabled = getSetting('bridge_proxy_enabled');
-  if (enabled === 'true') {
-    const host = getSetting('bridge_proxy_host');
-    const port = getSetting('bridge_proxy_port');
-    if (host && port) {
-      console.log('[proxy] Using database proxy:', `http://${host}:${port}`);
-      return `http://${host}:${port}`;
-    }
-  }
-  
-  // Fall back to environment variables
+  // Use environment variables first (set when starting the server)
   const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
   if (proxyUrl) {
     console.log('[proxy] Using env proxy:', proxyUrl);
+    return proxyUrl;
   }
-  return proxyUrl;
+  
+  // Fall back to database settings
+  try {
+    const enabled = getSetting('bridge_proxy_enabled');
+    if (enabled === 'true') {
+      const host = getSetting('bridge_proxy_host');
+      const port = getSetting('bridge_proxy_port');
+      if (host && port) {
+        console.log('[proxy] Using database proxy:', `http://${host}:${port}`);
+        return `http://${host}:${port}`;
+      }
+    }
+  } catch (e) {
+    // Database not available
+  }
+  return undefined;
 }
 
 /**
@@ -133,6 +138,12 @@ export async function proxyFetch(
     
     req.end();
   });
+  
+  // Add timeout handler
+  setTimeout(() => {
+    req.destroy();
+    reject(new Error('Proxy request timeout'));
+  }, 15000);
 }
 
 /**

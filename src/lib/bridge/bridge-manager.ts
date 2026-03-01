@@ -27,6 +27,66 @@ import {
   validateMode,
 } from './security/validators';
 
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+/**
+ * Get list of available skills from local file system
+ */
+async function getSkillsList(): Promise<Array<{name: string, description: string, content: string}>> {
+  const skills: Array<{name: string, description: string, content: string}> = [];
+  
+  // Scan different skill directories
+  const skillDirs = [
+    path.join(os.homedir(), '.claude', 'commands'),
+    path.join(os.homedir(), '.claude', 'skills'),
+    path.join(os.homedir(), '.agents', 'skills'),
+  ];
+  
+  for (const dir of skillDirs) {
+    if (!fs.existsSync(dir)) continue;
+    
+    try {
+      scanSkillDir(dir, skills);
+    } catch (err) {
+      console.warn('[bridge-manager] Failed to scan skill dir:', dir, err);
+    }
+  }
+  
+  return skills;
+}
+
+function scanSkillDir(dir: string, skills: Array<{name: string, description: string, content: string}>, baseName = ''): void {
+  if (!fs.existsSync(dir)) return;
+  
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    const name = baseName ? `${baseName}/${entry.name}` : entry.name;
+    
+    if (entry.isDirectory()) {
+      scanSkillDir(fullPath, skills, name);
+    } else if (entry.name.endsWith('.md')) {
+      try {
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        // Extract description from frontmatter
+        const descMatch = content.match(/description:\s*["']?([^"']+)["']?/);
+        const description = descMatch ? descMatch[1].trim() : '-';
+        
+        skills.push({
+          name: name.replace('.md', ''),
+          description: description,
+          content: content,
+        });
+      } catch (err) {
+        // Skip files that can't be read
+      }
+    }
+  }
+}
+
 const GLOBAL_KEY = '__bridge_manager__';
 
 interface AdapterMeta {
@@ -467,6 +527,8 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
+        '/skills - Select a skill to load',
+        '/skill <num> - Load skill by number',
         '/help - Show this help',
       ].join('\n');
       break;
@@ -573,6 +635,56 @@ async function handleCommand(
       break;
     }
 
+    case '/skills': {
+      // Fetch skills list from local file system
+      try {
+        const skills = await getSkillsList();
+        if (skills.length === 0) {
+          response = '暂无可用技能。';
+          break;
+        }
+        
+        // Build skills list message (first 20 skills)
+        const skillsList = skills.slice(0, 20).map((s, i) => 
+          `${i + 1}. ${s.name}\n   ${(s.description || '-').slice(0, 50)}`
+        ).join('\n\n');
+        
+        response = `<b>可用技能列表:</b>\n\n${skillsList}\n\n<i>发送 /skill &lt;编号&gt; 加载技能</i>`;
+      } catch (err) {
+        console.error('[bridge-manager] /skills error:', err);
+        response = 'Failed to load skills. Please try again.';
+      }
+      break;
+    }
+
+    case '/skill': {
+      if (!args) {
+        response = 'Usage: /skill <number>\nSend /skills to see available skills.';
+        break;
+      }
+      
+      const skillNum = parseInt(args.trim(), 10);
+      if (isNaN(skillNum) || skillNum < 1) {
+        response = 'Invalid skill number. Send /skills to see available skills.';
+        break;
+      }
+      
+      try {
+        const skills = await getSkillsList();
+        if (skillNum > skills.length) {
+          response = `Invalid skill number (1-${skills.length}). Send /skills to see list.`;
+          break;
+        }
+        
+        const skill = skills[skillNum - 1];
+        response = `<b>技能: ${skill.name}</b>\n\n<i>技能已加载!</i>\n\n${(skill.description || '-')}`;
+      } catch (err) {
+        console.error('[bridge-manager] /skill error:', err);
+        response = 'Failed to load skill. Please try again.';
+      }
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
@@ -584,6 +696,8 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
+        '/skills - Select a skill to load',
+        '/skill <num> - Load skill by number',
         '/help - Show this help',
       ].join('\n');
       break;
