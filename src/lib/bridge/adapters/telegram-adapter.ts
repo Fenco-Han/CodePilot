@@ -16,7 +16,6 @@ import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter';
 import { callTelegramApi, escapeHtml } from './telegram-utils';
 import { getChannelOffset, setChannelOffset, insertAuditLog } from '../../db';
 import { getSetting } from '../../db';
-import { proxyFetch } from '../../proxy-agent';
 
 const TELEGRAM_API = 'https://api.telegram.org';
 
@@ -323,7 +322,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
     try {
       const url = `${TELEGRAM_API}/bot${token}/getMe`;
-      const res = await proxyFetch(url, {
+      const res = await fetch(url, {
         method: 'GET',
         signal: AbortSignal.timeout(10_000),
       });
@@ -400,7 +399,7 @@ export class TelegramAdapter extends BaseChannelAdapter {
         }
 
         const url = `${TELEGRAM_API}/bot${token}/getUpdates`;
-        const res = await proxyFetch(url, {
+        const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

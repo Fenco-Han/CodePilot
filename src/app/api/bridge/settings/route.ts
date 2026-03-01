@@ -9,9 +9,6 @@ const BRIDGE_SETTING_KEYS = [
   'bridge_default_work_dir',
   'bridge_default_model',
   'bridge_default_provider_id',
-  'bridge_proxy_enabled',
-  'bridge_proxy_host',
-  'bridge_proxy_port',
 ] as const;
 
 export async function GET() {

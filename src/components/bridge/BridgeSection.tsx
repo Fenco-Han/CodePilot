@@ -39,9 +39,6 @@ interface BridgeSettings {
   bridge_default_work_dir: string;
   bridge_default_model: string;
   bridge_default_provider_id: string;
-  bridge_proxy_enabled: string;
-  bridge_proxy_host: string;
-  bridge_proxy_port: string;
 }
 
 const DEFAULT_SETTINGS: BridgeSettings = {
@@ -51,9 +48,6 @@ const DEFAULT_SETTINGS: BridgeSettings = {
   bridge_default_work_dir: "",
   bridge_default_model: "",
   bridge_default_provider_id: "",
-  bridge_proxy_enabled: "",
-  bridge_proxy_host: "",
-  bridge_proxy_port: "",
 };
 
 export function BridgeSection() {
@@ -61,13 +55,9 @@ export function BridgeSection() {
   const [bridgeStatus, setBridgeStatus] = useState<BridgeStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const [workDir, setWorkDir] = useState("");
   const [model, setModel] = useState("");
-  const [proxyEnabled, setProxyEnabled] = useState(false);
-  const [proxyHost, setProxyHost] = useState("");
-  const [proxyPort, setProxyPort] = useState("");
   const [providerGroups, setProviderGroups] = useState<ProviderModelGroup[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const { t } = useTranslation();
@@ -88,10 +78,6 @@ export function BridgeSection() {
         } else {
           setModel("");
         }
-        // Load proxy settings
-        setProxyEnabled(s.bridge_proxy_enabled === "true");
-        setProxyHost(s.bridge_proxy_host || "");
-        setProxyPort(s.bridge_proxy_port || "");
       }
     } catch {
       // ignore
@@ -180,9 +166,6 @@ export function BridgeSection() {
       bridge_default_work_dir: workDir,
       bridge_default_model: modelValue,
       bridge_default_provider_id: providerId,
-      bridge_proxy_enabled: proxyEnabled ? "true" : "",
-      bridge_proxy_host: proxyHost,
-      bridge_proxy_port: proxyPort,
     });
   };
 
@@ -207,20 +190,15 @@ export function BridgeSection() {
 
   const handleStartBridge = async () => {
     setStarting(true);
-    setError(null);
     try {
-      const res = await fetch("/api/bridge", {
+      await fetch("/api/bridge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "start" }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Failed to start bridge");
-      }
       await fetchStatus();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start bridge");
+    } catch {
+      // ignore
     } finally {
       setStarting(false);
     }
@@ -343,11 +321,6 @@ export function BridgeSection() {
               )}
             </div>
           </div>
-          {error && (
-            <div className="mt-3 rounded-md bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-              {error}
-            </div>
-          )}
         </div>
       )}
 
@@ -519,50 +492,6 @@ export function BridgeSection() {
               <p className="text-xs text-muted-foreground mt-1">
                 {t("bridge.defaultModelHint")}
               </p>
-            </div>
-
-            {/* Proxy Settings */}
-            <div className="border-t border-border/30 pt-3 mt-3">
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <p className="text-sm font-medium">{t("bridge.proxy") || "Proxy"}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {t("bridge.proxyDesc") || "Configure proxy for Telegram API"}
-                  </p>
-                </div>
-                <Switch
-                  checked={proxyEnabled}
-                  onCheckedChange={setProxyEnabled}
-                  disabled={saving}
-                />
-              </div>
-              
-              {proxyEnabled && (
-                <div className="flex gap-2">
-                  <div className="flex-1">
-                    <Input
-                      value={proxyHost}
-                      onChange={(e) => setProxyHost(e.target.value)}
-                      placeholder="127.0.0.1"
-                      className="font-mono text-sm"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t("bridge.proxyHost") || "Host"}
-                    </p>
-                  </div>
-                  <div className="w-24">
-                    <Input
-                      value={proxyPort}
-                      onChange={(e) => setProxyPort(e.target.value)}
-                      placeholder="7897"
-                      className="font-mono text-sm"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t("bridge.proxyPort") || "Port"}
-                    </p>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
 

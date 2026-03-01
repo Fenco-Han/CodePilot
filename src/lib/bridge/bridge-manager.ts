@@ -96,7 +96,7 @@ export async function start(): Promise<void> {
   const bridgeEnabled = getSetting('remote_bridge_enabled') === 'true';
   if (!bridgeEnabled) {
     console.log('[bridge-manager] Bridge not enabled (remote_bridge_enabled != true)');
-    throw new Error('Bridge is not enabled. Please enable Bridge in settings first.');
+    return;
   }
 
   // Iterate all registered adapter types and create those that are enabled
@@ -132,7 +132,7 @@ export async function start(): Promise<void> {
     console.warn('[bridge-manager] No adapters started successfully, bridge not activated');
     state.adapters.clear();
     state.adapterMeta.clear();
-    throw new Error('No adapters started. Please enable at least one channel (e.g., Telegram) in Bridge settings.');
+    return;
   }
 
   // Mark running BEFORE starting consumer loops — runAdapterLoop checks

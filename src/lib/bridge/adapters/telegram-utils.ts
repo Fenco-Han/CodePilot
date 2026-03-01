@@ -5,8 +5,6 @@
  * Extracted from telegram-bot.ts to avoid duplication.
  */
 
-import { proxyFetch } from '../../proxy-agent';
-
 const TELEGRAM_API = 'https://api.telegram.org';
 
 export interface TelegramSendResult {
@@ -43,7 +41,7 @@ export async function callTelegramApi(
 ): Promise<TelegramSendResult> {
   try {
     const url = `${TELEGRAM_API}/bot${botToken}/${method}`;
-    const res = await proxyFetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),

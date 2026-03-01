@@ -16,7 +16,6 @@
  */
 
 import { getSetting, getActiveSessions, getAllSessions } from './db';
-import { proxyFetch } from './proxy-agent';
 import {
   callTelegramApi,
   escapeHtml,
@@ -275,7 +274,7 @@ export async function verifyBot(
 ): Promise<{ ok: boolean; botName?: string; error?: string }> {
   try {
     const url = `${TELEGRAM_API}/bot${botToken}/getMe`;
-    const res = await proxyFetch(url);
+    const res = await fetch(url);
     const data: TelegramBotInfo = await res.json();
 
     if (!data.ok || !data.result) {
@@ -298,13 +297,7 @@ export async function verifyBot(
 
     return { ok: true, botName };
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : 'Unknown error';
-    console.error('[telegram-bot] verifyBot error:', err);
-    // Provide clearer error message for network failures
-    if (errMsg.includes('fetch') || errMsg.includes('network') || errMsg.includes('ENOTFOUND') || errMsg.includes('ECONNREFUSED') || errMsg.includes('ETIMEDOUT') || errMsg.includes('timeout')) {
-      return { ok: false, error: 'Network error: Cannot connect to Telegram API. Please check your network/proxy settings.' };
-    }
-    return { ok: false, error: errMsg };
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
 }
 
@@ -319,7 +312,7 @@ export async function detectChatId(
   try {
     // Try getUpdates first (works when polling hasn't consumed the message)
     const url = `${TELEGRAM_API}/bot${botToken}/getUpdates`;
-    const res = await proxyFetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ limit: 100, timeout: 0, allowed_updates: ['message'] }),

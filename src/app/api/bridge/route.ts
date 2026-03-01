@@ -29,15 +29,8 @@ export async function POST(request: NextRequest) {
     const { action } = body;
 
     if (action === 'start') {
-      try {
-        await bridgeManager.start();
-        return Response.json({ ok: true, status: bridgeManager.getStatus() });
-      } catch (error) {
-        return Response.json(
-          { error: error instanceof Error ? error.message : 'Failed to start bridge' },
-          { status: 400 },
-        );
-      }
+      await bridgeManager.start();
+      return Response.json({ ok: true, status: bridgeManager.getStatus() });
     } else if (action === 'stop') {
       await bridgeManager.stop();
       return Response.json({ ok: true, status: bridgeManager.getStatus() });
