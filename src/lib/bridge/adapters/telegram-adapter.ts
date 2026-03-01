@@ -1,0 +1,524 @@
+/**
+ * Telegram Adapter — implements BaseChannelAdapter for Telegram Bot API.
+ *
+ * Uses long polling to consume updates, persists offset watermark to DB,
+ * and routes messages/callbacks through an internal async queue.
+ */
+
+import crypto from 'crypto';
+import type {
+  ChannelType,
+  InboundMessage,
+  OutboundMessage,
+  SendResult,
+} from '../types';
+import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter';
+import { callTelegramApi, escapeHtml } from './telegram-utils';
+import { getChannelOffset, setChannelOffset, insertAuditLog } from '../../db';
+import { getSetting } from '../../db';
+import { proxyFetch } from '../../proxy-agent';
+
+const TELEGRAM_API = 'https://api.telegram.org';
+
+/** Max number of recent update_ids to keep for idempotency dedup on restart. */
+const DEDUP_SET_MAX = 1000;
+
+/** Derive a short token-specific hash for per-bot offset isolation. */
+function tokenShortHash(botToken: string): string {
+  return crypto.createHash('sha256').update(botToken).digest('hex').slice(0, 8);
+}
+
+interface TelegramUpdate {
+  update_id: number;
+  message?: {
+    message_id: number;
+    chat: { id: number; first_name?: string; title?: string; username?: string };
+    from?: { id: number; first_name: string; username?: string };
+    text?: string;
+    date: number;
+  };
+  callback_query?: {
+    id: string;
+    from: { id: number; first_name: string; username?: string };
+    message?: { message_id: number; chat: { id: number } };
+    data?: string;
+  };
+}
+
+/**
+ * Async queue entry — resolved by the poll loop, consumed by consumeOne().
+ */
+interface QueueEntry {
+  message: InboundMessage;
+  resolve: () => void;
+}
+
+export class TelegramAdapter extends BaseChannelAdapter {
+  readonly channelType: ChannelType = 'telegram';
+
+  private running = false;
+  private abortController: AbortController | null = null;
+  private queue: InboundMessage[] = [];
+  private waiters: Array<(msg: InboundMessage | null) => void> = [];
+  private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
+  /** Committed offset — the highest update_id that has been safely enqueued or skipped. */
+  private committedOffset = 0;
+  /** In-memory set of recently processed update_ids for idempotency on restart. */
+  private recentUpdateIds = new Set<number>();
+  /** Stable bot user ID from Telegram's getMe, used for offset key identity. */
+  private botUserId: string | null = null;
+
+  get botToken(): string {
+    return getSetting('telegram_bot_token') || '';
+  }
+
+  async start(): Promise<void> {
+    if (this.running) return;
+
+    const configError = this.validateConfig();
+    if (configError) {
+      console.warn('[telegram-adapter] Cannot start:', configError);
+      return;
+    }
+
+    // Resolve bot identity via getMe before starting the poll loop.
+    // This provides a stable offset key that survives token rotation.
+    await this.resolveBotIdentity();
+
+    this.running = true;
+    this.abortController = new AbortController();
+
+    // Register bot commands menu with Telegram
+    this.registerCommands().catch(() => {});
+
+    // Start polling in background (no await — runs until stop())
+    this.pollLoop().catch(err => {
+      console.error('[telegram-adapter] Poll loop error:', err);
+    });
+
+    console.log('[telegram-adapter] Started (botUserId:', this.botUserId || 'fallback-to-hash', ')');
+  }
+
+  async stop(): Promise<void> {
+    if (!this.running) return;
+    this.running = false;
+    this.abortController?.abort();
+    this.abortController = null;
+
+    // Persist committed offset before shutdown
+    this.persistCommittedOffset();
+
+    // Reject all waiting consumers
+    for (const waiter of this.waiters) {
+      waiter(null);
+    }
+    this.waiters = [];
+
+    // Stop all typing indicators
+    for (const [, interval] of this.typingIntervals) {
+      clearInterval(interval);
+    }
+    this.typingIntervals.clear();
+
+    console.log('[telegram-adapter] Stopped');
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  consumeOne(): Promise<InboundMessage | null> {
+    // If there's a queued message, return it immediately
+    const queued = this.queue.shift();
+    if (queued) return Promise.resolve(queued);
+
+    // If not running, return null
+    if (!this.running) return Promise.resolve(null);
+
+    // Otherwise, wait for the poll loop to enqueue a message
+    return new Promise<InboundMessage | null>((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  async send(message: OutboundMessage): Promise<SendResult> {
+    const token = this.botToken;
+    if (!token) return { ok: false, error: 'No bot token configured' };
+
+    const params: Record<string, unknown> = {
+      chat_id: message.address.chatId,
+      text: message.text,
+      disable_web_page_preview: true,
+    };
+
+    if (message.parseMode === 'HTML') {
+      params.parse_mode = 'HTML';
+    } else if (message.parseMode === 'Markdown') {
+      params.parse_mode = 'Markdown';
+    }
+
+    if (message.replyToMessageId) {
+      params.reply_to_message_id = message.replyToMessageId;
+    }
+
+    // Inline keyboard buttons
+    if (message.inlineButtons && message.inlineButtons.length > 0) {
+      params.reply_markup = {
+        inline_keyboard: message.inlineButtons.map(row =>
+          row.map(btn => ({
+            text: btn.text,
+            callback_data: btn.callbackData,
+          }))
+        ),
+      };
+    }
+
+    return callTelegramApi(token, 'sendMessage', params);
+  }
+
+  async answerCallback(callbackQueryId: string, text?: string): Promise<void> {
+    const token = this.botToken;
+    if (!token) return;
+
+    await callTelegramApi(token, 'answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      text: text || 'OK',
+    });
+  }
+
+  validateConfig(): string | null {
+    const token = getSetting('telegram_bot_token');
+    if (!token) return 'telegram_bot_token not configured';
+
+    const bridgeEnabled = getSetting('bridge_telegram_enabled');
+    if (bridgeEnabled !== 'true') return 'bridge_telegram_enabled is not true';
+
+    return null;
+  }
+
+  isAuthorized(userId: string, chatId: string): boolean {
+    // Check bridge-specific allowed users first
+    const allowedUsers = getSetting('telegram_bridge_allowed_users') || '';
+    if (allowedUsers) {
+      const allowed = allowedUsers.split(',').map(s => s.trim()).filter(Boolean);
+      if (allowed.length > 0) {
+        return allowed.includes(userId) || allowed.includes(chatId);
+      }
+    }
+
+    // Fallback: check notification bot's chat_id
+    const notifyChatId = getSetting('telegram_chat_id') || '';
+    if (notifyChatId) {
+      return chatId === notifyChatId;
+    }
+
+    // No auth configured — deny by default
+    return false;
+  }
+
+  /**
+   * Start a typing indicator that fires every 5 seconds.
+   */
+  startTyping(chatId: string): void {
+    this.stopTyping(chatId); // Clear any existing
+    const token = this.botToken;
+    if (!token) return;
+
+    // Send immediately
+    callTelegramApi(token, 'sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+
+    // Repeat every 5s
+    const interval = setInterval(() => {
+      callTelegramApi(token, 'sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+    }, 5000);
+    this.typingIntervals.set(chatId, interval);
+  }
+
+  /**
+   * Stop the typing indicator for a chat.
+   */
+  stopTyping(chatId: string): void {
+    const interval = this.typingIntervals.get(chatId);
+    if (interval) {
+      clearInterval(interval);
+      this.typingIntervals.delete(chatId);
+    }
+  }
+
+  /**
+   * Acknowledge that an update has been fully processed by the bridge-manager.
+   * Only at this point do we advance the committed offset and persist it.
+   * This ensures no message is lost if the process crashes between enqueue and processing.
+   */
+  acknowledgeUpdate(updateId: number): void {
+    this.markUpdateProcessed(updateId);
+    this.persistCommittedOffset();
+  }
+
+  // ── Lifecycle hooks (called generically by bridge-manager) ───
+
+  onMessageStart(chatId: string): void {
+    this.startTyping(chatId);
+  }
+
+  onMessageEnd(chatId: string): void {
+    this.stopTyping(chatId);
+  }
+
+  // ── Private ──────────────────────────────────────────────────
+
+  /**
+   * Register slash commands with Telegram Bot API so they appear in the menu.
+   */
+  private async registerCommands(): Promise<void> {
+    const token = this.botToken;
+    if (!token) return;
+
+    await callTelegramApi(token, 'setMyCommands', {
+      commands: [
+        { command: 'new', description: 'Start new session (optionally specify path)' },
+        { command: 'bind', description: 'Bind to existing session' },
+        { command: 'cwd', description: 'Change working directory' },
+        { command: 'mode', description: 'Switch mode: plan / code / ask' },
+        { command: 'status', description: 'Show current session status' },
+        { command: 'sessions', description: 'List recent sessions' },
+        { command: 'stop', description: 'Stop current task' },
+        { command: 'help', description: 'Show available commands' },
+      ],
+    });
+  }
+
+  private enqueue(msg: InboundMessage): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(msg);
+    } else {
+      this.queue.push(msg);
+    }
+  }
+
+  /**
+   * Return the DB key used to store the offset, scoped to the bot's stable identity.
+   * Uses the bot user ID (from getMe) which survives token rotation.
+   * Falls back to the token hash if getMe was not successful.
+   */
+  private offsetKey(): string {
+    if (this.botUserId) {
+      return 'telegram:bot' + this.botUserId;
+    }
+    const token = this.botToken;
+    if (!token) return 'telegram';
+    return 'telegram:' + tokenShortHash(token);
+  }
+
+  /**
+   * Resolve the bot's stable user ID via Telegram's getMe API.
+   * On first startup with bot-ID-based key, migrates the offset from the
+   * old token-hash-based key so no messages are re-fetched.
+   */
+  private async resolveBotIdentity(): Promise<void> {
+    const token = this.botToken;
+    if (!token) return;
+
+    try {
+      const url = `${TELEGRAM_API}/bot${token}/getMe`;
+      const res = await proxyFetch(url, {
+        method: 'GET',
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = await res.json();
+      if (data.ok && data.result?.id) {
+        this.botUserId = String(data.result.id);
+
+        // Migrate offset from old token-hash key to new bot-ID key
+        const newKey = 'telegram:bot' + this.botUserId;
+        const oldKey = 'telegram:' + tokenShortHash(token);
+        const existingNew = getChannelOffset(newKey);
+        if (!existingNew || existingNew === '0') {
+          const existingOld = getChannelOffset(oldKey);
+          if (existingOld && existingOld !== '0') {
+            setChannelOffset(newKey, existingOld);
+            console.log(`[telegram-adapter] Migrated offset from ${oldKey} to ${newKey}: ${existingOld}`);
+          }
+        }
+      } else {
+        console.warn('[telegram-adapter] getMe did not return a valid bot ID, falling back to token hash');
+      }
+    } catch (err) {
+      console.warn('[telegram-adapter] getMe failed, falling back to token hash:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
+   * Mark an update as safely processed (enqueued or intentionally skipped).
+   * Advances committedOffset and prunes the dedup set when it exceeds capacity.
+   */
+  private markUpdateProcessed(updateId: number): void {
+    if (updateId >= this.committedOffset) {
+      this.committedOffset = updateId + 1;
+    }
+    this.recentUpdateIds.add(updateId);
+    if (this.recentUpdateIds.size > DEDUP_SET_MAX) {
+      // Remove oldest entries (Set iterates in insertion order)
+      const excess = this.recentUpdateIds.size - DEDUP_SET_MAX;
+      let removed = 0;
+      for (const id of this.recentUpdateIds) {
+        if (removed >= excess) break;
+        this.recentUpdateIds.delete(id);
+        removed++;
+      }
+    }
+  }
+
+  /**
+   * Persist the committed offset to DB. Safe to call at any time.
+   */
+  private persistCommittedOffset(): void {
+    if (this.committedOffset <= 0) return;
+    try {
+      setChannelOffset(this.offsetKey(), String(this.committedOffset));
+    } catch { /* best effort */ }
+  }
+
+  private async pollLoop(): Promise<void> {
+    const key = this.offsetKey();
+
+    // Load persisted committed offset
+    this.committedOffset = parseInt(getChannelOffset(key), 10) || 0;
+
+    // fetchOffset is used for the getUpdates API call; starts at committed offset
+    let fetchOffset = this.committedOffset;
+
+    while (this.running) {
+      try {
+        const token = this.botToken;
+        if (!token) {
+          console.warn('[telegram-adapter] No bot token, waiting...');
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
+
+        const url = `${TELEGRAM_API}/bot${token}/getUpdates`;
+        const res = await proxyFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            offset: fetchOffset,
+            timeout: 30,
+            allowed_updates: ['message', 'callback_query'],
+          }),
+          signal: this.abortController?.signal,
+        });
+
+        if (!this.running) break;
+
+        const data = await res.json();
+        if (!data.ok || !Array.isArray(data.result)) {
+          console.warn('[telegram-adapter] getUpdates failed:', JSON.stringify(data).slice(0, 200));
+          continue;
+        }
+        const updates: TelegramUpdate[] = data.result;
+        for (const update of updates) {
+          // Advance fetchOffset so the next getUpdates call skips this update
+          if (update.update_id >= fetchOffset) {
+            fetchOffset = update.update_id + 1;
+          }
+
+          // Idempotency: skip updates already processed (dedup on restart)
+          if (this.recentUpdateIds.has(update.update_id)) {
+            this.markUpdateProcessed(update.update_id);
+            continue;
+          }
+
+          if (update.callback_query) {
+            const cb = update.callback_query;
+            const chatId = cb.message?.chat.id ? String(cb.message.chat.id) : '';
+            const userId = String(cb.from.id);
+
+            if (!this.isAuthorized(userId, chatId)) {
+              console.warn('[telegram-adapter] Unauthorized callback from userId:', userId, 'chatId:', chatId);
+              this.markUpdateProcessed(update.update_id);
+              continue;
+            }
+
+            const msg: InboundMessage = {
+              messageId: cb.id,
+              address: {
+                channelType: 'telegram',
+                chatId,
+                userId,
+                displayName: cb.from.username || cb.from.first_name,
+              },
+              text: '',
+              timestamp: Date.now(),
+              callbackData: cb.data,
+              callbackMessageId: cb.message?.message_id ? String(cb.message.message_id) : undefined,
+              raw: update,
+              updateId: update.update_id,
+            };
+
+            this.enqueue(msg);
+
+            // Answer callback to dismiss the loading state
+            this.answerCallback(cb.id).catch(() => {});
+          } else if (update.message?.text) {
+            const m = update.message;
+            const chatId = String(m.chat.id);
+            const userId = m.from ? String(m.from.id) : chatId;
+
+            if (!this.isAuthorized(userId, chatId)) {
+              console.warn('[telegram-adapter] Unauthorized message from userId:', userId, 'chatId:', chatId);
+              this.markUpdateProcessed(update.update_id);
+              continue;
+            }
+
+            const msg: InboundMessage = {
+              messageId: String(m.message_id),
+              address: {
+                channelType: 'telegram',
+                chatId,
+                userId,
+                displayName: m.from?.username || m.from?.first_name || chatId,
+              },
+              text: m.text!,
+              timestamp: m.date * 1000,
+              raw: update,
+              updateId: update.update_id,
+            };
+
+            // Audit log
+            try {
+              insertAuditLog({
+                channelType: 'telegram',
+                chatId,
+                direction: 'inbound',
+                messageId: String(m.message_id),
+                summary: m.text!.slice(0, 200),
+              });
+            } catch { /* best effort */ }
+
+            this.enqueue(msg);
+          } else {
+            // Unhandled update type — still safe to advance past it
+            this.markUpdateProcessed(update.update_id);
+          }
+        }
+
+        // Persist committed offset after processing the batch
+        this.persistCommittedOffset();
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') break;
+        console.warn('[telegram-adapter] Polling error:', err instanceof Error ? err.message : err);
+        // Persist whatever we've safely committed before backing off
+        this.persistCommittedOffset();
+        if (this.running) {
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      }
+    }
+  }
+}
+
+// Self-register so bridge-manager can create TelegramAdapter via the registry.
+registerAdapterFactory('telegram', () => new TelegramAdapter());
